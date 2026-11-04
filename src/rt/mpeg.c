@@ -185,6 +185,7 @@ typedef struct {
     int atracAlign, atracChannels;
     int16_t *audioPcm;
     uint64_t audioAusOut, audioDecoded, audioRejected, audioSkipped;
+    int audioDryReported;        /* SR_MPEGLOG: the dry-demux census line printed once */
 } Mpeg;
 
 static Mpeg s_mpeg[8];
@@ -300,6 +301,18 @@ static void mpeg_audio_pump(Mpeg *ctx) {
             ctx->audioFifo[tail].bytes = au.size;
             ctx->audioFifoCount++;
             ctx->audioAusOut++;
+            /* The demuxed AU's real PES clock, against the synthetic counter GetAtracAu hands
+             * out: when the two part ways, a guest pacing on the AU pts stalls before the
+             * header's last timestamp.  First 8 and every 256th, bounded like the video probe. */
+            if (getenv("SR_MPEGLOG")) {
+                static int an = 0;
+                if (an++ < 8 || (an & 0xFF) == 0)
+                    fprintf(stderr, "AudioDemux AU #%d realPts=%lld rawPts=%lld synthPts=%lld "
+                                    "sid=%02x size=%" PRIu32 " uid=0x%" PRIx32 "\n",
+                            an, (long long)au.pts, (long long)au.raw_pts,
+                            (long long)(ctx->audioPts + ctx->firstTimestamp),
+                            au.stream_id, au.size, sched_current_uid());
+            }
             sr_psmf_au_release(&au);
             continue;
         }
@@ -497,10 +510,18 @@ static void analyze(uint32_t buffer, Mpeg *ctx) {
             ctx->streamWidth = ctx->streamHeight = 0;
     }
     ctx->fedPackets = 0;
-    /* Whole-movie packet count from the PSMF stream size; the movie ends when the game has fed
-     * this many packets into the ring and they have been consumed (real EOF, not a header
-     * timestamp which only covers the first segment). */
-    ctx->totalPackets = ctx->streamSize / 2048u;
+    /* Whole-movie packet count: the game feeds the program-stream bytes that follow the header,
+     * and the header's own stream size covers the whole file -- a retail PSMF header carries the
+     * 2048-byte header inside the count (UCES01421's movies: streamSize 9164800, a 2048-byte
+     * header, 4474 packets of stream data, and the game puts exactly those 4474). Counting the
+     * header as a packet made every whole-movie-in condition one packet out of reach: the getters
+     * never saw the stream end, the decoder never flushed its last pictures, and a title pacing on
+     * the video end waited forever. The movie ends when the game has fed this many packets into
+     * the ring and they have been consumed (real EOF, not a header timestamp which only covers the
+     * first segment). */
+    ctx->totalPackets = ctx->streamSize > ctx->offset
+                            ? (ctx->streamSize - ctx->offset) / MPEG_PACKET_SIZE
+                            : 0u;
     ctx->streamEnded = 0;
     ctx->videoDryAt = ctx->audioDryAt = 0;
     if (getenv("SR_MPEGLOG"))
@@ -802,6 +823,44 @@ uint32_t mpeg_ringbuffer_put(CpuState *s, uint32_t ring, uint32_t numPackets, ui
             !sr_guest_span_readable_current(dst, gotBytes))
             return 0;
 
+        /* SR_MPEGDUMP=<dir>: capture the exact program-stream bytes the demuxers receive, one
+         * file per mpeg context.  Bounded (64 MiB per context) so a looping title cannot grow it
+         * without end; the capture is the ground truth for offline packet census. */
+        if (getenv("SR_MPEGDUMP") && ctx && got) {
+            static char dump_dir[512];
+            static int dump_dir_ready = -1;
+            if (dump_dir_ready < 0) {
+                const char *e = getenv("SR_MPEGDUMP");
+                snprintf(dump_dir, sizeof dump_dir, "%s", e ? e : "");
+                dump_dir_ready = dump_dir[0] ? 1 : 0;
+            }
+            if (dump_dir_ready) {
+                static FILE *dump_f[8];
+                static uint32_t dump_slot_mpeg[8];
+                static uint64_t dump_bytes[8];
+                int slot = -1;
+                for (int i = 0; i < 8; i++) {
+                    if (dump_f[i] && dump_slot_mpeg[i] == mpegAddr) { slot = i; break; }
+                    if (!dump_f[i] && slot < 0) slot = i;
+                }
+                if (slot >= 0) {
+                    if (!dump_f[slot]) {
+                        char path[640];
+                        snprintf(path, sizeof path, "%s\\mpeg_0x%08" PRIx32 ".ps",
+                                 dump_dir, mpegAddr);
+                        dump_f[slot] = fopen(path, "wb");
+                        dump_slot_mpeg[slot] = mpegAddr;
+                        dump_bytes[slot] = 0;
+                    }
+                    if (dump_f[slot] && dump_bytes[slot] < 64u * 1024u * 1024u) {
+                        fwrite((const uint8_t *)SR_HOST(dst), 1, gotBytes, dump_f[slot]);
+                        dump_bytes[slot] += gotBytes;
+                        if ((dump_bytes[slot] & 0x1FFFFFu) < gotBytes) fflush(dump_f[slot]);
+                    }
+                }
+            }
+        }
+
 #if defined(SR_SDL3VK) || defined(SR_MPEG_MEDIA_SELFTEST)
         if (ctx && got) {
             if (!ctx->h264Init) { ctx->h264Init = 1; ctx->h264 = sr_h264_create(); }
@@ -903,12 +962,25 @@ uint32_t mpeg_get_avc_au(uint32_t mpegAddr, uint32_t sid, uint32_t auAddr, uint3
         int r = sr_h264_au_take(ctx->h264, 0, &psConsumed, &auPts);
         if (r == 0 && !ctx->streamEnded && mpeg_feed_stopped(ctx, &ctx->videoDryAt)) {
             ctx->streamEnded = 1;
+            if (getenv("SR_MPEGLOG"))
+                fprintf(stderr, "MpegStreamEnded fed=%" PRIu32 " total=%" PRIu32 " ringAvail=%" PRIu32
+                                " frames=%d units=%d uid=0x%" PRIx32 "\n",
+                        ctx->fedPackets, ctx->totalPackets, rb_get(ring, RB_packetsAvail),
+                        ctx->h264Frames, ctx->h264Units, sched_current_uid());
             r = sr_h264_au_take(ctx->h264, 1, &psConsumed, &auPts);
         }
         if (r > 0) ctx->h264Units++;
         else if (r == 0 && held) r = 1;
         if (r == 0) {
-            if (ctx->streamEnded) ctx->videoEnd = 1;
+            if (ctx->streamEnded && !ctx->videoEnd) {
+                ctx->videoEnd = 1;
+                if (getenv("SR_MPEGLOG"))
+                    fprintf(stderr, "MpegVideoEnd fed=%" PRIu32 " ringAvail=%" PRIu32
+                                    " frames=%d units=%d lastAuPts=%lld uid=0x%" PRIx32 "\n",
+                            ctx->fedPackets, rb_get(ring, RB_packetsAvail),
+                            ctx->h264Frames, ctx->h264Units, (long long)ctx->lastAuPts,
+                            sched_current_uid());
+            }
             g_mpeg_nodata++;
             if (getenv("SR_MPEGLOG")) {
                 static int n = 0;
@@ -1029,6 +1101,37 @@ uint32_t mpeg_get_atrac_au(uint32_t mpegAddr, uint32_t sid, uint32_t auAddr, uin
                         ctx->audioFifoCount, (void *)ctx->audioDemux, ctx->audioDemuxFailed,
                         ctx->ringAddr ? rb_get(ctx->ringAddr, RB_packetsAvail) : 0u,
                         sched_current_uid());
+        }
+        /* First dry report per context: what the audio demux actually saw.  These numbers decide
+         * between a truncated feed (fedPackets below the header's totalPackets), a parser that
+         * stopped mid-stream (cursor below the fed bytes), and a demux that saw everything and
+         * found no more audio (cursor at the fed bytes with audio_aus standing for the whole
+         * track).  sr_psmf_au.pts is the real PES clock; the AU time base we hand out is the
+         * synthetic one, so their difference is the clock drift a guest end check would see. */
+        if (!ctx->audioDryReported) {
+            ctx->audioDryReported = 1;
+            if (ctx->audioDemux) {
+                SrPsmfProducerStats st;
+                sr_psmf_producer_stats(ctx->audioDemux, &st);
+                fprintf(stderr,
+                        "MpegAudioDry mpeg=0x%" PRIx32 " fedBytes=%" PRIu64 " cursor=%" PRIu64
+                        " packs=%" PRIu64 " audioPes=%" PRIu64 " audioAus=%" PRIu64
+                        " audioResync=%" PRIu64 " noPtsAus=%" PRIu64 " audioBuffered=%" PRIu32
+                        " parserFailures=%" PRIu64 " failOffset=%" PRIu64
+                        " firstPts=%lld lastPts=%lld havePts=%d"
+                        " skipped=%" PRIu64 " ausOut=%" PRIu64 " decoded=%" PRIu64
+                        " audioFedPackets=%" PRIu32 " totalPackets=%" PRIu32
+                        " fedPackets=%" PRIu32 " synthPts=%lld ringAvail=%" PRIu32 "\n",
+                        mpegAddr, sr_psmf_producer_stream_bytes(ctx->audioDemux),
+                        sr_psmf_producer_stream_cursor(ctx->audioDemux),
+                        st.packs, st.audio_pes, st.audio_aus, st.audio_resync_bytes,
+                        st.aus_without_pts, st.audio_buffered, st.parser_failures, st.fail_offset,
+                        (long long)st.first_pts, (long long)st.last_pts, st.have_pts,
+                        ctx->audioSkipped, ctx->audioAusOut, ctx->audioDecoded,
+                        ctx->audioFedPackets, ctx->totalPackets, ctx->fedPackets,
+                        (long long)(ctx->audioPts + ctx->firstTimestamp),
+                        ctx->ringAddr ? rb_get(ctx->ringAddr, RB_packetsAvail) : 0u);
+            }
         }
         if (!ctx->audioDemux || ctx->audioDemuxFailed)
             mpeg_audio_report(ctx, "sceMpegGetAtracAu has no demultiplexed ATRAC stream; reporting no data");

@@ -139,6 +139,7 @@
     X("SR_MISS_SEEDS", "path", "unset (no file written)", "perf.c", "File to which the run's distinct dispatch-miss targets are written at exit, one guest address per line, for tools/miss_seeds.py.") \
     X("SR_MODULE_DIR", "path", "place_game_here/EXTRACTED/decrypted", "hle_kernel_module.c,hle_thread_selftest.c", "Directory holding the decrypted guest modules the runtime loads.") \
     X("SR_MPEGAV", "flag-presence", "off", "hle.c", "Enables MPEG/PSMF audio-video sync logging (also enabled by SR_MPEGLOG).") \
+    X("SR_MPEGDUMP", "path", "unset or empty: no capture written", "mpeg.c", "Captures the program-stream bytes the MPEG demuxers receive, one file per sceMpeg context, bounded to 64 MiB per context; game-derived bytes, never commit.") \
     X("SR_MPEGLOG", "flag-presence", "off", "debug.h,h264_ffmpeg.c,h264_mf.c,hle.c,hle_mpeg.c,mpeg.c", "Enables MPEG and H.264 decoder diagnostic logging in the video and MPEG HLE code.") \
     X("SR_MSGLOG", "flag-presence", "off", "hle_kernel_sync.c", "When set, logs message pipe creation and calls to stderr.") \
     X("SR_NAN_TRAP_CONTEXT", "flag-nonzero", "off", "debug.c", "Dumps scheduler CPU state and guest memory context when a NaN trap fires.") \

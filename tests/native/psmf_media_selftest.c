@@ -4095,7 +4095,10 @@ static void test_mpeg_looped_stream_feeds_past_header_size(uint32_t lead, int st
     }
     memcpy(SR_HOST(LP_HDR), image, 2048u);
     memcpy(SR_HOST(LP_HDR + 4u), "0015", 4u);
-    be32_at((uint8_t *)SR_HOST(LP_HDR + 12u), packets * MPEG_PACKET_SIZE);
+    /* Retail PSMF headers carry the whole file in the stream size: the 2048-byte header plus the
+     * stream data (UCES01421's movie headers do; the runtime counts the game's feedable packets as
+     * (streamSize - stream offset) / packet size). */
+    be32_at((uint8_t *)SR_HOST(LP_HDR + 12u), (packets + 1u) * MPEG_PACKET_SIZE);
     MEM_W32(LP_DESC, 0u);
     CHECK(mpeg_ringbuffer_construct(LP_RING, 2u * packets, LP_RING_DATA,
                                     2u * packets * MPEG_RING_BYTES_PER_PKT, 0u, 0u) == 0u &&
@@ -4154,7 +4157,10 @@ static void test_mpeg_last_unit_keeps_its_ring_packets(void) {
     }
     memcpy(SR_HOST(LU_HDR), image, 2048u);
     memcpy(SR_HOST(LU_HDR + 4u), "0015", 4u);
-    be32_at((uint8_t *)SR_HOST(LU_HDR + 12u), packets * MPEG_PACKET_SIZE);
+    /* Retail PSMF headers carry the whole file in the stream size: the 2048-byte header plus the
+     * stream data (UCES01421's movie headers do; the runtime counts the game's feedable packets as
+     * (streamSize - stream offset) / packet size). */
+    be32_at((uint8_t *)SR_HOST(LU_HDR + 12u), (packets + 1u) * MPEG_PACKET_SIZE);
     MEM_W32(LU_DESC, 0u);
     CHECK(mpeg_ringbuffer_construct(LU_RING, packets, LU_RING_DATA,
                                     packets * MPEG_RING_BYTES_PER_PKT, 0u, 0u) == 0u &&
@@ -4232,7 +4238,10 @@ static void test_mpeg_atrac_au_decode(void) {
     }
     memcpy(SR_HOST(AT_HDR), image, 2048u);
     memcpy(SR_HOST(AT_HDR + 4u), "0015", 4u);
-    be32_at((uint8_t *)SR_HOST(AT_HDR + 12u), packets * MPEG_PACKET_SIZE);
+    /* Retail PSMF headers carry the whole file in the stream size: the 2048-byte header plus the
+     * stream data (UCES01421's movie headers do; the runtime counts the game's feedable packets as
+     * (streamSize - stream offset) / packet size). */
+    be32_at((uint8_t *)SR_HOST(AT_HDR + 12u), (packets + 1u) * MPEG_PACKET_SIZE);
     MEM_W32(AT_DESC, 0u);
     CHECK(mpeg_ringbuffer_construct(AT_RING, packets, AT_RING_DATA, packets * MPEG_RING_BYTES_PER_PKT,
                                     0u, 0u) == 0u &&
